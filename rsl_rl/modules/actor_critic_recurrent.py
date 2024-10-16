@@ -58,8 +58,11 @@ class ActorCriticRecurrent(ActorCritic):
         input_a = self.memory_a(observations, masks, hidden_states)
         return super().act(input_a.squeeze(0))
 
-    def act_inference(self, observations):
-        input_a = self.memory_a(observations)
+    def act_inference(self, observations, masks=None, hidden_states=None):
+        if masks is None:
+            input_a = self.memory_a(observations)
+        else:
+            input_a = self.memory_a(observations, masks, hidden_states)
         return super().act_inference(input_a.squeeze(0))
 
     def evaluate(self, critic_observations, masks=None, hidden_states=None):

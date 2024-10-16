@@ -107,7 +107,7 @@ class ActorCritic(nn.Module):
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
-    def act_inference(self, observations):
+    def act_inference(self, observations, **kwargs):
         actions_mean = self.actor(observations)
         return actions_mean
 
