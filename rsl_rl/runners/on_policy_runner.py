@@ -27,9 +27,14 @@ class OnPolicyRunner:
         self.device = device
         self.env = env
         obs, extras = self.env.get_observations()
+        if isinstance(obs, dict):
+            obs = torch.cat(list(obs.values()), dim=1)
         num_obs = obs.shape[1]
         if "critic" in extras["observations"]:
-            num_critic_obs = extras["observations"]["critic"].shape[1]
+            critic_obs = extras["observations"]["critic"]
+            if isinstance(obs, dict):
+                critic_obs = torch.cat(list(critic_obs.values()), dim=1)
+            num_critic_obs = critic_obs.shape[1]
         else:
             num_critic_obs = num_obs
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))  # ActorCritic
@@ -92,6 +97,10 @@ class OnPolicyRunner:
             )
         obs, extras = self.env.get_observations()
         critic_obs = extras["observations"].get("critic", obs)
+        if isinstance(obs, dict):
+            obs = torch.cat(list(obs.values()), dim=1)
+        if isinstance(critic_obs, dict):
+            critic_obs = torch.cat(list(critic_obs.values()), dim=1)
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
@@ -110,6 +119,8 @@ class OnPolicyRunner:
                 for i in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, critic_obs)
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    if isinstance(obs, dict):
+                        obs = torch.cat(list(obs.values()), dim=1)
                     # move to the right device
                     obs, critic_obs, rewards, dones = (
                         obs.to(self.device),
@@ -120,7 +131,10 @@ class OnPolicyRunner:
                     # perform normalization
                     obs = self.obs_normalizer(obs)
                     if "critic" in infos["observations"]:
-                        critic_obs = self.critic_obs_normalizer(infos["observations"]["critic"])
+                        critic_obs = infos["observations"]["critic"]
+                        if isinstance(critic_obs, dict):
+                            critic_obs = torch.cat(list(critic_obs.values()), dim=1)
+                        critic_obs = self.critic_obs_normalizer(critic_obs)
                     else:
                         critic_obs = obs
                     # process the step
