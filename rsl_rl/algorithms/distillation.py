@@ -92,12 +92,24 @@ class Distillation:
         )
 
     def act(self, obs: TensorDict) -> torch.Tensor:
-        # Compute the actions
-        self.transition.actions = self.policy.act(obs).detach()
-        self.transition.privileged_actions = self.policy.evaluate(obs).detach()
+        # Compute student and teacher actions
+        student_actions = self.policy.act(obs).detach()
+        teacher_actions = self.policy.evaluate(obs).detach()
+        
+        # Mix actions: first half uses student, second half uses teacher
+        num_envs = student_actions.shape[0]
+        half = num_envs // 2
+        
+        # Create mixed actions tensor
+        mixed_actions = student_actions.clone()
+        mixed_actions[half:] = teacher_actions[half:]
+        
+        # Record the actions (student actions for loss computation)
+        self.transition.actions = mixed_actions
+        self.transition.privileged_actions = teacher_actions
         # Record the observations
         self.transition.observations = obs
-        return self.transition.actions
+        return mixed_actions
 
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
