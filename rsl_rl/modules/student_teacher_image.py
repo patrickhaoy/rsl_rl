@@ -61,7 +61,7 @@ class StudentTeacherImage(nn.Module):
         # Identify proprioceptive keys (non-image student observations)
         self.proprio_keys = [k for k in obs_groups["policy"] if k not in image_keys]
         
-        # Build image encoder (ResNet backbone)
+        # Build image encoders (one ResNet backbone per image)
         resnet_models = {
             "resnet18": torchvision.models.resnet18,
             "resnet34": torchvision.models.resnet34,
@@ -70,13 +70,19 @@ class StudentTeacherImage(nn.Module):
         if resnet_type not in resnet_models:
             raise ValueError(f"Unknown resnet_type: {resnet_type}. Supported: {list(resnet_models.keys())}")
         
-        # Train from scratch (no pretrained weights)
-        backbone = resnet_models[resnet_type](weights=None)
+        # Create one encoder per image key
+        self.image_encoders = nn.ModuleDict()
+        for key in image_keys:
+            backbone = resnet_models[resnet_type](weights=None)
+            # Get feature dimension before removing fc layer
+            if not hasattr(self, 'image_feature_dim'):
+                self.image_feature_dim = backbone.fc.in_features
+            backbone.fc = nn.Identity()
+            self.image_encoders[key] = backbone
         
-        # Get feature dimension before removing fc layer
-        self.image_feature_dim = backbone.fc.in_features
-        backbone.fc = nn.Identity()
-        self.image_encoder = backbone
+        # ImageNet normalization constants
+        self.register_buffer('imagenet_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('imagenet_std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
         
         # Calculate student input dimension
         num_images = len([k for k in image_keys if k in obs_groups["policy"]])
@@ -162,18 +168,20 @@ class StudentTeacherImage(nn.Module):
                 # Normalize to [0, 1]
                 if img.max() > 1.0:
                     img = img.float() / 255.0
-                # Encode
-                feat = self.image_encoder(img)
+                # Apply ImageNet normalization
+                img = (img - self.imagenet_mean) / self.imagenet_std
+                # Encode using the encoder for this image key
+                feat = self.image_encoders[key](img)
                 features.append(feat)
-        return torch.cat(features, dim=-1) if features else torch.empty(obs[self.proprio_keys[0]].shape[0], 0, device=obs[self.proprio_keys[0]].device)
+        return torch.cat(features, dim=-1) #if features else torch.empty(obs[self.proprio_keys[0]].shape[0], 0, device=obs[self.proprio_keys[0]].device)
 
     def _get_proprio(self, obs: TensorDict) -> torch.Tensor:
         """Get proprioceptive observations."""
         proprio_list = []
         for key in self.proprio_keys:
-            if key in obs:
-                proprio_list.append(obs[key])
-        return torch.cat(proprio_list, dim=-1) if proprio_list else torch.empty(0)
+            # if key in obs:
+            proprio_list.append(obs['policy'][key])
+        return torch.cat(proprio_list, dim=-1) #if proprio_list else torch.empty(0)
 
     def _update_distribution(self, features: torch.Tensor) -> None:
         mean = self.student(features)
@@ -187,8 +195,7 @@ class StudentTeacherImage(nn.Module):
 
     def get_student_obs(self, obs: TensorDict) -> torch.Tensor:
         """Process student observations: encode images + normalize proprio."""
-        obs = obs['policy']
-        image_features = self._encode_images(obs)
+        image_features = self._encode_images(obs['policy'])
         proprio = self._get_proprio(obs)
         if proprio.numel() > 0:
             proprio = self.student_obs_normalizer(proprio)

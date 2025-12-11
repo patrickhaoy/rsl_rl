@@ -204,7 +204,7 @@ class OnPolicyRunner:
                     self.writer.add_scalar("Episode/" + key, value, locs["it"])
                     ep_string += f"""{f"Mean episode {key}:":>{pad}} {value:.4f}\n"""
 
-        mean_std = self.alg.policy.action_std.mean()
+        # mean_std = self.alg.policy.action_std.mean()
         fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
 
         # Log losses
@@ -213,7 +213,7 @@ class OnPolicyRunner:
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
 
         # Log noise std
-        self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
+        # self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
 
         # Log performance
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
@@ -244,7 +244,7 @@ class OnPolicyRunner:
                 f"""{str.center(width, " ")}\n\n"""
                 f"""{"Computation:":>{pad}} {fps:.0f} steps/s (collection: {locs["collection_time"]:.3f}s, learning {
                     locs["learn_time"]:.3f}s)\n"""
-                f"""{"Mean action noise std:":>{pad}} {mean_std.item():.2f}\n"""
+                # f"""{"Mean action noise std:":>{pad}} {mean_std.item():.2f}\n"""
             )
             # Print losses
             for key, value in locs["loss_dict"].items():
@@ -264,7 +264,7 @@ class OnPolicyRunner:
                 f"""{str.center(width, " ")}\n\n"""
                 f"""{"Computation:":>{pad}} {fps:.0f} steps/s (collection: {locs["collection_time"]:.3f}s, learning {
                     locs["learn_time"]:.3f}s)\n"""
-                f"""{"Mean action noise std:":>{pad}} {mean_std.item():.2f}\n"""
+                # f"""{"Mean action noise std:":>{pad}} {mean_std.item():.2f}\n"""
             )
             for key, value in locs["loss_dict"].items():
                 log_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""

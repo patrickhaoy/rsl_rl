@@ -93,7 +93,8 @@ class Distillation:
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         # Compute student and teacher actions
-        student_actions = self.policy.act(obs).detach()
+        # student_actions = self.policy.act(obs).detach()
+        student_actions = self.policy.act_inference(obs).detach()
         teacher_actions = self.policy.evaluate(obs).detach()
         
         # Mix actions: first half uses student, second half uses teacher
@@ -137,6 +138,7 @@ class Distillation:
             for obs, _, privileged_actions, dones in self.storage.generator():
                 # Inference of the student for gradient computation
                 actions = self.policy.act_inference(obs)
+                # actions = self.policy.act(obs)
 
                 # Behavior cloning loss
                 behavior_loss = self.loss_fn(actions, privileged_actions)
