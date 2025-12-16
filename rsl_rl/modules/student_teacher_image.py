@@ -13,6 +13,7 @@ from torch.distributions import Normal
 from typing import Any, NoReturn
 
 from rsl_rl.networks import MLP, EmpiricalNormalization, HiddenState
+from rsl_rl.modules.actor_critic import GSDENoiseDistribution
 
 
 class StudentTeacherImage(nn.Module):
@@ -57,7 +58,7 @@ class StudentTeacherImage(nn.Module):
         if image_keys is None:
             image_keys = ["front_rgb", "side_rgb", "wrist_rgb"]
         self.image_keys = image_keys
-        
+
         # Identify proprioceptive keys (non-image student observations)
         self.proprio_keys = [k for k in obs_groups["policy"] if k not in image_keys]
         
@@ -72,13 +73,16 @@ class StudentTeacherImage(nn.Module):
         
         # Create one encoder per image key
         self.image_encoders = nn.ModuleDict()
-        for key in image_keys:
-            backbone = resnet_models[resnet_type](weights=None)
-            # Get feature dimension before removing fc layer
-            if not hasattr(self, 'image_feature_dim'):
-                self.image_feature_dim = backbone.fc.in_features
-            backbone.fc = nn.Identity()
-            self.image_encoders[key] = backbone
+        if len(image_keys) > 0:
+            for key in image_keys:
+                backbone = resnet_models[resnet_type](weights=None)
+                # Get feature dimension before removing fc layer
+                if not hasattr(self, 'image_feature_dim'):
+                    self.image_feature_dim = backbone.fc.in_features
+                backbone.fc = nn.Identity()
+                self.image_encoders[key] = backbone
+        else:
+            self.image_feature_dim = 0
         
         # ImageNet normalization constants
         self.register_buffer('imagenet_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
@@ -129,11 +133,23 @@ class StudentTeacherImage(nn.Module):
             self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
         elif self.noise_std_type == "log":
             self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+        elif self.noise_std_type == "gsde":
+            self.log_std = nn.Parameter(
+                torch.ones(student_hidden_dims[-1], num_actions) * torch.log(torch.tensor(init_noise_std))
+            )
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}")
         
-        self.distribution = None
+        # Action distribution
+        if self.noise_std_type == "gsde":
+            self.distribution = GSDENoiseDistribution(action_dim=num_actions)
+            self.distribution.sample_weights(self.log_std)
+        else:
+            self.distribution = None
         Normal.set_default_validate_args(False)
+        
+        # Teacher gSDE log_std (loaded from checkpoint) - shape: [teacher_hidden_dims[-1], num_actions]
+        self.register_buffer('teacher_log_std', torch.ones(teacher_hidden_dims[-1], num_actions) * torch.log(torch.tensor(init_noise_std)))
 
     def reset(
         self, dones: torch.Tensor | None = None, hidden_states: tuple[HiddenState, HiddenState] = (None, None)
@@ -187,24 +203,29 @@ class StudentTeacherImage(nn.Module):
         mean = self.student(features)
         if self.noise_std_type == "scalar":
             std = self.std.expand_as(mean)
+            self.distribution = Normal(mean, std)
         elif self.noise_std_type == "log":
             std = torch.exp(self.log_std).expand_as(mean)
+            self.distribution = Normal(mean, std)
+        elif self.noise_std_type == "gsde":
+            latent_features = self.student[:-1](features)
+            self.distribution.proba_distribution(mean, self.log_std, latent_features)
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}")
-        self.distribution = Normal(mean, std)
 
     def get_student_obs(self, obs: TensorDict) -> torch.Tensor:
         """Process student observations: encode images + normalize proprio."""
-        image_features = self._encode_images(obs['policy'])
+        # image_features = self._encode_images(obs['policy'])
         proprio = self._get_proprio(obs)
         if proprio.numel() > 0:
             proprio = self.student_obs_normalizer(proprio)
-        if image_features.numel() > 0 and proprio.numel() > 0:
-            return torch.cat([image_features, proprio], dim=-1)
-        elif image_features.numel() > 0:
-            return image_features
-        else:
-            return proprio
+        return proprio
+        # if image_features.numel() > 0 and proprio.numel() > 0:
+        #     return torch.cat([image_features, proprio], dim=-1)
+        # elif image_features.numel() > 0:
+        #     return image_features
+        # else:
+        #     return proprio
 
     def get_teacher_obs(self, obs: TensorDict) -> torch.Tensor:
         obs_list = [obs[obs_group] for obs_group in self.obs_groups["teacher"]]
@@ -224,6 +245,41 @@ class StudentTeacherImage(nn.Module):
         teacher_obs = self.teacher_obs_normalizer(teacher_obs)
         with torch.no_grad():
             return self.teacher(teacher_obs)
+
+    def get_student_distribution(self, obs: TensorDict) -> Normal:
+        """Get the student's action distribution for KL divergence computation."""
+        features = self.get_student_obs(obs)
+        mean = self.student(features)
+        if self.noise_std_type == "scalar":
+            std = self.std.expand_as(mean)
+        elif self.noise_std_type == "log":
+            std = torch.exp(self.log_std).expand_as(mean)
+        elif self.noise_std_type == "gsde":
+            # For gSDE, compute state-dependent std
+            latent_features = self.student[:-1](features)
+            log_std = self.log_std
+            std_weights = torch.exp(log_std)
+            # variance = (phi(s)^2) @ (sigma^2)
+            variance = torch.mm(latent_features**2, std_weights**2)
+            std = torch.sqrt(variance + 1e-6)
+        else:
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}")
+        return Normal(mean, std)
+
+    def get_teacher_distribution(self, obs: TensorDict) -> Normal:
+        """Get the teacher's action distribution for KL divergence computation (gSDE)."""
+        teacher_obs = self.get_teacher_obs(obs)
+        teacher_obs = self.teacher_obs_normalizer(teacher_obs)
+        with torch.no_grad():
+            mean = self.teacher(teacher_obs)
+            # Compute gSDE state-dependent std using teacher's latent features
+            latent_features = self.teacher[:-1](teacher_obs)
+            # Ensure teacher_log_std is on the same device as latent_features
+            teacher_log_std = self.teacher_log_std.to(latent_features.device)
+            std_weights = torch.exp(teacher_log_std)
+            variance = torch.mm(latent_features**2, std_weights**2)
+            std = torch.sqrt(variance + 1e-6)
+        return Normal(mean, std)
 
     def get_hidden_states(self) -> tuple[HiddenState, HiddenState]:
         return None, None
@@ -254,6 +310,10 @@ class StudentTeacherImage(nn.Module):
                     teacher_state_dict[key.replace("actor.", "")] = value
                 if "actor_obs_normalizer." in key:
                     teacher_obs_normalizer_state_dict[key.replace("actor_obs_normalizer.", "")] = value
+                # Load teacher's gSDE log_std for KL divergence
+                if key == "log_std":
+                    # Re-register buffer with correct shape from checkpoint
+                    self.register_buffer('teacher_log_std', value.clone())
             self.teacher.load_state_dict(teacher_state_dict, strict=strict)
             if teacher_obs_normalizer_state_dict:
                 self.teacher_obs_normalizer.load_state_dict(teacher_obs_normalizer_state_dict, strict=strict)

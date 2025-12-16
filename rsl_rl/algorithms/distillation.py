@@ -5,6 +5,7 @@
 
 import torch
 import torch.nn as nn
+import torch.distributions as D
 from tensordict import TensorDict
 
 from rsl_rl.modules import StudentTeacher, StudentTeacherRecurrent
@@ -62,9 +63,11 @@ class Distillation:
         self.max_grad_norm = max_grad_norm
 
         # Initialize the loss function
+        self.loss_type = loss_type
         loss_fn_dict = {
             "mse": nn.functional.mse_loss,
             "huber": nn.functional.huber_loss,
+            "kl": None,  # Handled specially in update()
         }
         if loss_type in loss_fn_dict:
             self.loss_fn = loss_fn_dict[loss_type]
@@ -94,7 +97,8 @@ class Distillation:
     def act(self, obs: TensorDict) -> torch.Tensor:
         # Compute student and teacher actions
         # student_actions = self.policy.act(obs).detach()
-        student_actions = self.policy.act_inference(obs).detach()
+        # student_actions = self.policy.act_inference(obs).detach()
+        student_actions = self.policy.act(obs).detach()
         teacher_actions = self.policy.evaluate(obs).detach()
 
         # Record the actions (student actions for loss computation)
@@ -128,12 +132,18 @@ class Distillation:
             self.policy.reset(hidden_states=self.last_hidden_states)
             self.policy.detach_hidden_states()
             for obs, _, privileged_actions, dones in self.storage.generator():
-                # Inference of the student for gradient computation
-                actions = self.policy.act_inference(obs)
-                # actions = self.policy.act(obs)
-
-                # Behavior cloning loss
-                behavior_loss = self.loss_fn(actions, privileged_actions)
+                # Compute loss based on loss type
+                if self.loss_type == "kl":
+                    # KL divergence between student and teacher distributions
+                    student_dist = self.policy.get_student_distribution(obs)
+                    teacher_dist = self.policy.get_teacher_distribution(obs)
+                    # KL(student || teacher) - sum over action dims, mean over batch
+                    behavior_loss = D.kl_divergence(student_dist, teacher_dist).sum(dim=-1).mean()
+                    actions = student_dist.rsample()  # For logging/debugging
+                else:
+                    # MSE/Huber on actions
+                    actions = self.policy.act(obs)
+                    behavior_loss = self.loss_fn(actions, privileged_actions)
 
                 # Total loss
                 loss = loss + behavior_loss
