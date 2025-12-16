@@ -30,6 +30,19 @@ class RolloutStorage:
         def clear(self) -> None:
             self.__init__()
 
+    @staticmethod
+    def _create_obs_storage(obs: TensorDict, num_transitions_per_env: int, num_envs: int, device: str) -> TensorDict:
+        """Recursively create storage for nested TensorDicts."""
+        storage_dict = {}
+        for key, value in obs.items():
+            if isinstance(value, TensorDict):
+                # Recursively handle nested TensorDict
+                storage_dict[key] = RolloutStorage._create_obs_storage(value, num_transitions_per_env, num_envs, device)
+            else:
+                # Create tensor storage with shape [num_transitions, *original_shape]
+                storage_dict[key] = torch.zeros(num_transitions_per_env, *value.shape, device=device)
+        return TensorDict(storage_dict, batch_size=[num_transitions_per_env, num_envs], device=device)
+
     def __init__(
         self,
         training_type: str,
@@ -45,12 +58,8 @@ class RolloutStorage:
         self.num_envs = num_envs
         self.actions_shape = actions_shape
 
-        # Core
-        self.observations = TensorDict(
-            {key: torch.zeros(num_transitions_per_env, *value.shape, device=device) for key, value in obs.items()},
-            batch_size=[num_transitions_per_env, num_envs],
-            device=self.device,
-        )
+        # Core - handle nested TensorDicts
+        self.observations = self._create_obs_storage(obs, num_transitions_per_env, num_envs, device)
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
@@ -75,13 +84,22 @@ class RolloutStorage:
         # Counter for the number of transitions stored
         self.step = 0
 
+    @staticmethod
+    def _copy_obs(dest: TensorDict, src: TensorDict) -> None:
+        """Recursively copy observations from src to dest TensorDict."""
+        for key in src.keys():
+            if isinstance(src[key], TensorDict):
+                RolloutStorage._copy_obs(dest[key], src[key])
+            else:
+                dest[key].copy_(src[key])
+
     def add_transitions(self, transition: Transition) -> None:
         # Check if the transition is valid
         if self.step >= self.num_transitions_per_env:
             raise OverflowError("Rollout buffer overflow! You should call clear() before adding new transitions.")
 
         # Core
-        self.observations[self.step].copy_(transition.observations)
+        self._copy_obs(self.observations[self.step], transition.observations)
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))

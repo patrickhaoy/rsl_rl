@@ -5,6 +5,7 @@
 
 import torch
 import torch.nn as nn
+import torch.distributions as D
 from tensordict import TensorDict
 
 from rsl_rl.modules import StudentTeacher, StudentTeacherRecurrent
@@ -62,9 +63,11 @@ class Distillation:
         self.max_grad_norm = max_grad_norm
 
         # Initialize the loss function
+        self.loss_type = loss_type
         loss_fn_dict = {
             "mse": nn.functional.mse_loss,
             "huber": nn.functional.huber_loss,
+            "kl": lambda a, b: D.kl_divergence(a, b).sum(dim=-1).mean(),
         }
         if loss_type in loss_fn_dict:
             self.loss_fn = loss_fn_dict[loss_type]
@@ -123,11 +126,13 @@ class Distillation:
             self.policy.reset(hidden_states=self.last_hidden_states)
             self.policy.detach_hidden_states()
             for obs, _, privileged_actions, dones in self.storage.generator():
-                # Inference of the student for gradient computation
-                actions = self.policy.act_inference(obs)
-
-                # Behavior cloning loss
-                behavior_loss = self.loss_fn(actions, privileged_actions)
+                if self.loss_type == "kl":
+                    student_dist = self.policy.get_student_distribution(obs)
+                    teacher_dist = self.policy.get_teacher_distribution(obs)
+                    behavior_loss = self.loss_fn(student_dist, teacher_dist)
+                else:
+                    actions = self.policy.act_inference(obs)
+                    behavior_loss = self.loss_fn(actions, privileged_actions)
 
                 # Total loss
                 loss = loss + behavior_loss
