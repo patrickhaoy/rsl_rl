@@ -9,12 +9,10 @@ import torch
 import torch.nn as nn
 import torchvision
 from tensordict import TensorDict
-from torch.distributions import Normal
 from typing import Any
 
 from rsl_rl.networks import MLP, EmpiricalNormalization
 from rsl_rl.modules.student_teacher import StudentTeacher
-from rsl_rl.modules.actor_critic import GSDENoiseDistribution
 
 
 class StudentTeacherVision(StudentTeacher):
@@ -38,6 +36,9 @@ class StudentTeacherVision(StudentTeacher):
         noise_std_type: str = "scalar",
         **kwargs: dict[str, Any],
     ) -> None:
+        assert obs_groups == {"policy": ["policy"], "teacher": ["teacher"]}, "obs_groups is not supported for StudentTeacherVision"
+        self.obs_groups = obs_groups
+
         # Must call nn.Module.__init__ first before assigning any nn.Module
         nn.Module.__init__(self)
 
@@ -45,15 +46,14 @@ class StudentTeacherVision(StudentTeacher):
         self.image_keys = []
         self.low_dim_keys = []
         num_low_dim = 0
-        for obs_group in obs_groups["policy"]:
-            for key in obs[obs_group].keys():
-                if obs[obs_group][key].dim() == 4:
-                    self.image_keys.append(key)
-                elif obs[obs_group][key].dim() == 2:
-                    self.low_dim_keys.append(key)
-                    num_low_dim += obs[obs_group][key].shape[-1]
-                else:
-                    raise ValueError(f"Unknown observation dimension: {obs[obs_group][key].dim()}")
+        for key in obs["policy"].keys():
+            if obs["policy"][key].dim() == 4:
+                self.image_keys.append(key)
+            elif obs["policy"][key].dim() == 2:
+                self.low_dim_keys.append(key)
+                num_low_dim += obs["policy"][key].shape[-1]
+            else:
+                raise ValueError(f"Unknown observation dimension: {obs['policy'][key].dim()}")
         self.image_keys = sorted(self.image_keys)
         self.low_dim_keys = sorted(self.low_dim_keys)
 
@@ -63,7 +63,7 @@ class StudentTeacherVision(StudentTeacher):
 
         if self.image_keys:
             for key in self.image_keys:
-                backbone = torchvision.models.resnet18(weights=None)
+                backbone = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.IMAGENET1K_V1)
                 self.image_feature_dim = backbone.fc.in_features
                 backbone.fc = nn.Identity()
                 self.image_encoders[key] = backbone
@@ -75,7 +75,6 @@ class StudentTeacherVision(StudentTeacher):
         print(f"Student input: {len(self.image_keys)} images * {self.image_feature_dim} + {num_low_dim} low_dim = {num_student_obs}")
 
         self.loaded_teacher = False
-        self.obs_groups = obs_groups
 
         # ImageNet normalization
         self.register_buffer('imagenet_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
@@ -94,7 +93,7 @@ class StudentTeacherVision(StudentTeacher):
             self.student_obs_normalizer = nn.Identity()
 
         # Teacher (state-based)
-        num_teacher_obs = sum(obs[k].shape[-1] for k in obs_groups["teacher"])
+        num_teacher_obs = obs["teacher"].shape[-1]
         self.teacher = MLP(num_teacher_obs, num_actions, teacher_hidden_dims, activation)
         self.teacher.eval()
         print(f"Teacher MLP: {self.teacher}")
@@ -110,27 +109,18 @@ class StudentTeacherVision(StudentTeacher):
         self.noise_std_type = noise_std_type
         if noise_std_type == "scalar":
             self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
-            self.teacher_std = nn.Parameter(init_noise_std * torch.ones(num_actions))
         elif noise_std_type == "log":
             self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
-            self.teacher_log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
-        elif noise_std_type == "gsde":
-            self.log_std = nn.Parameter(
-                torch.ones(student_hidden_dims[-1], num_actions) * torch.log(torch.tensor(init_noise_std))
-            )
-            self.teacher_log_std = nn.Parameter(
-                torch.ones(teacher_hidden_dims[-1], num_actions) * torch.log(torch.tensor(init_noise_std))
-            )
         else:
             raise ValueError(f"Unknown noise_std_type: {noise_std_type}. Should be 'scalar', 'log', or 'gsde'")
 
-        # Action distribution
-        if noise_std_type == "gsde":
-            self.distribution = GSDENoiseDistribution(action_dim=num_actions)
-            self.distribution.sample_weights(self.log_std)
+        # Auxiliary prediction head (predicts auxiliary observations from features)
+        if "auxiliary" in obs:
+            num_auxiliary_obs = obs["auxiliary"].shape[-1]
+            self.auxiliary_head = MLP(num_student_obs, num_auxiliary_obs, student_hidden_dims[:2], activation)
+            print(f"Auxiliary head MLP: {self.auxiliary_head}")
         else:
-            self.distribution = None
-        Normal.set_default_validate_args(False)
+            self.auxiliary_head = None
 
     def _encode_images(self, obs: TensorDict) -> torch.Tensor | None:
         """Encode images through ResNet backbones."""
@@ -138,7 +128,7 @@ class StudentTeacherVision(StudentTeacher):
             return None
         features = []
         for key in self.image_keys:
-            img = obs[key]
+            img = obs["policy"][key]
             if img.shape[-1] == 3:  # [N, H, W, C] -> [N, C, H, W]
                 img = img.permute(0, 3, 1, 2)
             if img.max() > 1.0:
@@ -149,10 +139,18 @@ class StudentTeacherVision(StudentTeacher):
 
     def _get_low_dim_obs(self, obs: TensorDict) -> torch.Tensor:
         low_dim = []
-        for obs_group in self.obs_groups["policy"]:
-            for key in self.low_dim_keys:
-                low_dim.append(obs[obs_group][key])
+        for key in self.low_dim_keys:
+            low_dim.append(obs["policy"][key])
         return torch.cat(low_dim, dim=-1)
+
+    def act(self, obs: TensorDict) -> torch.Tensor:
+        obs = self.get_student_obs(obs)
+        self._update_distribution(obs)
+        return self.distribution.sample()
+
+    def act_inference(self, obs: TensorDict) -> torch.Tensor:
+        obs = self.get_student_obs(obs)
+        return self.student(obs)
 
     def get_student_obs(self, obs: TensorDict) -> torch.Tensor:
         """Encode images and concatenate with normalized low-dim obs."""
@@ -169,53 +167,11 @@ class StudentTeacherVision(StudentTeacher):
 
         return torch.cat(parts, dim=-1)
 
-    def get_student_distribution(self, obs: TensorDict) -> Normal:
-        features = self.get_student_obs(obs)
-        mean = self.student(features)
-        if self.noise_std_type == "scalar":
-            std = self.std.expand_as(mean)
-        elif self.noise_std_type == "log":
-            std = torch.exp(self.log_std).expand_as(mean)
-        elif self.noise_std_type == "gsde":
-            # For gSDE, compute state-dependent std
-            latent_features = self.student[:-1](features)
-            log_std = self.log_std
-            std_weights = torch.exp(log_std)
-            # variance = (phi(s)^2) @ (sigma^2)
-            variance = torch.mm(latent_features**2, std_weights**2)
-            std = torch.sqrt(variance + 1e-6)
-        else:
-            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}")
-        return Normal(mean, std)
-
-    @torch.no_grad()
-    def get_teacher_distribution(self, obs: TensorDict) -> Normal:
-        teacher_obs = self.get_teacher_obs(obs)
-        teacher_obs = self.teacher_obs_normalizer(teacher_obs)
-        mean = self.teacher(teacher_obs)
-        if self.noise_std_type == "scalar":
-            std = self.teacher_std.expand_as(mean)
-        elif self.noise_std_type == "log":
-            std = torch.exp(self.teacher_log_std).expand_as(mean)
-        elif self.noise_std_type == "gsde":
-            latent_features = self.teacher[:-1](teacher_obs)
-            teacher_log_std = self.teacher_log_std.to(latent_features.device)
-            std_weights = torch.exp(teacher_log_std)
-            variance = torch.mm(latent_features**2, std_weights**2)
-            std = torch.sqrt(variance + 1e-6)
-        else:
-            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}")
-        return Normal(mean, std)
-
     def update_normalization(self, obs: TensorDict) -> None:
         if self.student_obs_normalization and self.num_low_dim > 0:
             low_dim = self._get_low_dim_obs(obs)
             self.student_obs_normalizer.update(low_dim)
 
-    def load_state_dict(self, state_dict: dict, strict: bool = True) -> bool:
-        if any("actor" in key for key in state_dict) and not any("student" in key for key in state_dict):
-            if self.noise_std_type == "gsde" or self.noise_std_type == "log":
-                self.teacher_log_std.data.copy_(state_dict["log_std"])
-            else:
-                self.teacher_std.data.copy_(state_dict["std"])
-        return super().load_state_dict(state_dict, strict=strict)
+    def predict_auxiliary(self, obs: TensorDict) -> torch.Tensor:
+        obs = self.get_student_obs(obs)
+        return self.auxiliary_head(obs)

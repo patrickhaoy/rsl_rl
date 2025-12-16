@@ -12,7 +12,6 @@ from torch.distributions import Normal
 from typing import Any, NoReturn
 
 from rsl_rl.networks import MLP, EmpiricalNormalization, HiddenState
-from rsl_rl.modules.actor_critic import GSDENoiseDistribution
 
 
 class StudentTeacher(nn.Module):
@@ -81,19 +80,12 @@ class StudentTeacher(nn.Module):
             self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
         elif self.noise_std_type == "log":
             self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
-        elif self.noise_std_type == "gsde":
-            self.log_std = nn.Parameter(
-                torch.ones(student_hidden_dims[-1], num_actions) * torch.log(torch.tensor(init_noise_std))
-            )
         else:
-            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar', 'log', or 'gsde'")
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
 
         # Action distribution
-        if self.noise_std_type == "gsde":
-            self.distribution = GSDENoiseDistribution(action_dim=num_actions)
-            self.distribution.sample_weights(self.log_std)
-        else:
-            self.distribution = None
+        # Note: Populated in update_distribution
+        self.distribution = None
 
         # Disable args validation for speedup
         Normal.set_default_validate_args(False)
@@ -118,22 +110,18 @@ class StudentTeacher(nn.Module):
     def entropy(self) -> torch.Tensor:
         return self.distribution.entropy().sum(dim=-1)
 
-    def _update_distribution(self, obs: torch.Tensor) -> None:
+    def _update_distribution(self, obs: TensorDict) -> None:
         # Compute mean
         mean = self.student(obs)
-        # Create distribution
-        if self.noise_std_type == "gsde":
-            features = self.student[:-1](obs)
-            self.distribution.proba_distribution(mean, self.log_std, features)
+        # Compute standard deviation
+        if self.noise_std_type == "scalar":
+            std = self.std.expand_as(mean)
+        elif self.noise_std_type == "log":
+            std = torch.exp(self.log_std).expand_as(mean)
         else:
-            # Compute standard deviation
-            if self.noise_std_type == "scalar":
-                std = self.std.expand_as(mean)
-            elif self.noise_std_type == "log":
-                std = torch.exp(self.log_std).expand_as(mean)
-            else:
-                raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}")
-            self.distribution = Normal(mean, std)
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        # Create distribution
+        self.distribution = Normal(mean, std)
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         obs = self.get_student_obs(obs)

@@ -5,7 +5,6 @@
 
 import torch
 import torch.nn as nn
-import torch.distributions as D
 from tensordict import TensorDict
 
 from rsl_rl.modules import StudentTeacher, StudentTeacherRecurrent
@@ -27,6 +26,7 @@ class Distillation:
         learning_rate: float = 1e-3,
         max_grad_norm: float | None = None,
         loss_type: str = "mse",
+        auxiliary_loss_weight: float = 1.0,
         optimizer: str = "adam",
         device: str = "cpu",
         # Distributed training parameters
@@ -61,13 +61,13 @@ class Distillation:
         self.gradient_length = gradient_length
         self.learning_rate = learning_rate
         self.max_grad_norm = max_grad_norm
+        self.auxiliary_loss_weight = auxiliary_loss_weight
 
         # Initialize the loss function
         self.loss_type = loss_type
         loss_fn_dict = {
             "mse": nn.functional.mse_loss,
             "huber": nn.functional.huber_loss,
-            "kl": lambda a, b: D.kl_divergence(a, b).sum(dim=-1).mean(),
         }
         if loss_type in loss_fn_dict:
             self.loss_fn = loss_fn_dict[loss_type]
@@ -119,6 +119,7 @@ class Distillation:
     def update(self) -> dict[str, float]:
         self.num_updates += 1
         mean_behavior_loss = 0
+        mean_auxiliary_loss = 0
         loss = 0
         cnt = 0
 
@@ -126,16 +127,19 @@ class Distillation:
             self.policy.reset(hidden_states=self.last_hidden_states)
             self.policy.detach_hidden_states()
             for obs, _, privileged_actions, dones in self.storage.generator():
-                if self.loss_type == "kl":
-                    student_dist = self.policy.get_student_distribution(obs)
-                    teacher_dist = self.policy.get_teacher_distribution(obs)
-                    behavior_loss = self.loss_fn(student_dist, teacher_dist)
+                actions = self.policy.act_inference(obs)
+                behavior_loss = self.loss_fn(actions, privileged_actions)
+
+                # Auxiliary prediction loss
+                if hasattr(self.policy, 'auxiliary_head') and self.policy.auxiliary_head is not None:
+                    aux_pred = self.policy.predict_auxiliary(obs)
+                    auxiliary_loss = self.loss_fn(aux_pred, obs['auxiliary'])
+                    mean_auxiliary_loss += auxiliary_loss.item()
                 else:
-                    actions = self.policy.act_inference(obs)
-                    behavior_loss = self.loss_fn(actions, privileged_actions)
+                    auxiliary_loss = 0.0
 
                 # Total loss
-                loss = loss + behavior_loss
+                loss = loss + behavior_loss + self.auxiliary_loss_weight * auxiliary_loss
                 mean_behavior_loss += behavior_loss.item()
                 cnt += 1
 
@@ -156,12 +160,13 @@ class Distillation:
                 self.policy.detach_hidden_states(dones.view(-1))
 
         mean_behavior_loss /= cnt
+        mean_auxiliary_loss /= cnt
         self.storage.clear()
         self.last_hidden_states = self.policy.get_hidden_states()
         self.policy.detach_hidden_states()
 
         # Construct the loss dictionary
-        loss_dict = {"behavior": mean_behavior_loss}
+        loss_dict = {"behavior": mean_behavior_loss, "auxiliary": mean_auxiliary_loss}
 
         return loss_dict
 
