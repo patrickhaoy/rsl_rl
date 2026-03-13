@@ -231,11 +231,13 @@ class StudentTeacher(nn.Module):
             self.teacher.load_state_dict(teacher_state_dict, strict=strict)
             self.teacher_obs_normalizer.load_state_dict(teacher_obs_normalizer_state_dict, strict=strict)
             # Load teacher action noise std for KL loss support
+            # Move to model device to avoid device mismatch under multi-GPU / DDP
+            device = next(self.parameters()).device
             if "std" in state_dict:
-                self.register_buffer("teacher_action_std", state_dict["std"])
+                self.register_buffer("teacher_action_std", state_dict["std"].to(device))
                 self.teacher_noise_std_type = "scalar"
             elif "log_std" in state_dict:
-                self.register_buffer("teacher_action_log_std", state_dict["log_std"])
+                self.register_buffer("teacher_action_log_std", state_dict["log_std"].to(device))
                 self.teacher_noise_std_type = "gsde" if state_dict["log_std"].dim() == 2 else "log"
             # Set flag for successfully loading the parameters
             self.loaded_teacher = True
