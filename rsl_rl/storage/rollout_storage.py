@@ -168,13 +168,32 @@ class RolloutStorage:
         if normalize_advantage:
             self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
 
-    # For distillation
+    # For distillation (sequential, for recurrent policies)
     def generator(self) -> Generator:
         if self.training_type != "distillation":
             raise ValueError("This function is only available for distillation training.")
 
         for i in range(self.num_transitions_per_env):
             yield self.observations[i], self.actions[i], self.privileged_actions[i], self.dones[i]
+
+    # For distillation with feedforward policies (shuffled IID mini-batches)
+    def distillation_mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 4) -> Generator:
+        if self.training_type != "distillation":
+            raise ValueError("This function is only available for distillation training.")
+
+        batch_size = self.num_envs * self.num_transitions_per_env
+        mini_batch_size = batch_size // num_mini_batches
+
+        observations = self.observations.flatten(0, 1)
+        privileged_actions = self.privileged_actions.flatten(0, 1)
+
+        for epoch in range(num_epochs):
+            indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
+            for i in range(num_mini_batches):
+                start = i * mini_batch_size
+                stop = (i + 1) * mini_batch_size
+                batch_idx = indices[start:stop]
+                yield observations[batch_idx], privileged_actions[batch_idx]
 
     # For reinforcement learning with feedforward networks
     def mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator:

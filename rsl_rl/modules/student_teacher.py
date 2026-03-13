@@ -83,6 +83,9 @@ class StudentTeacher(nn.Module):
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
 
+        # Teacher action noise (loaded from RL checkpoint in load_state_dict)
+        self.teacher_noise_std_type: str | None = None
+
         # Action distribution
         # Note: Populated in update_distribution
         self.distribution = None
@@ -104,6 +107,10 @@ class StudentTeacher(nn.Module):
 
     @property
     def action_std(self) -> torch.Tensor:
+        if self.noise_std_type == "scalar":
+            return self.std
+        elif self.noise_std_type == "log":
+            return torch.exp(self.log_std)
         return self.distribution.stddev
 
     @property
@@ -135,10 +142,44 @@ class StudentTeacher(nn.Module):
         return self.student(obs)
 
     def evaluate(self, obs: TensorDict) -> torch.Tensor:
-        obs = self.get_teacher_obs(obs)
-        obs = self.teacher_obs_normalizer(obs)
+        teacher_obs = self.get_teacher_obs(obs)
+        teacher_obs = self.teacher_obs_normalizer(teacher_obs)
         with torch.no_grad():
-            return self.teacher(obs)
+            actions = self.teacher(teacher_obs)
+        return actions
+
+    def get_student_distribution(self, obs: TensorDict) -> Normal:
+        """Return student action distribution (mean from MLP, std from learnable param)."""
+        student_obs = self.get_student_obs(obs)
+        student_obs = self.student_obs_normalizer(student_obs)
+        mean = self.student(student_obs)
+        if self.noise_std_type == "scalar":
+            std = self.std.expand_as(mean)
+        elif self.noise_std_type == "log":
+            std = torch.exp(self.log_std).expand_as(mean)
+        else:
+            raise ValueError(f"Unknown noise_std_type: {self.noise_std_type}")
+        return Normal(mean, std)
+
+    def get_teacher_distribution(self, obs: TensorDict) -> Normal:
+        """Return teacher action distribution. Requires teacher std loaded from RL checkpoint."""
+        if self.teacher_noise_std_type is None:
+            raise RuntimeError("Teacher noise std not loaded. KL loss requires an RL checkpoint with std/log_std.")
+        teacher_obs = self.get_teacher_obs(obs)
+        teacher_obs = self.teacher_obs_normalizer(teacher_obs)
+        with torch.no_grad():
+            mean = self.teacher(teacher_obs)
+            if self.teacher_noise_std_type == "scalar":
+                std = self.teacher_action_std.expand_as(mean)
+            elif self.teacher_noise_std_type == "log":
+                std = torch.exp(self.teacher_action_log_std).expand_as(mean)
+            elif self.teacher_noise_std_type == "gsde":
+                features = self.teacher[:-1](teacher_obs)
+                variance = torch.mm(features ** 2, torch.exp(self.teacher_action_log_std) ** 2)
+                std = torch.sqrt(variance + 1e-6)
+            else:
+                raise ValueError(f"Unknown teacher_noise_std_type: {self.teacher_noise_std_type}")
+        return Normal(mean, std)
 
     def get_student_obs(self, obs: TensorDict) -> torch.Tensor:
         obs_list = [obs[obs_group] for obs_group in self.obs_groups["policy"]]
@@ -189,6 +230,13 @@ class StudentTeacher(nn.Module):
                     teacher_obs_normalizer_state_dict[key.replace("actor_obs_normalizer.", "")] = value
             self.teacher.load_state_dict(teacher_state_dict, strict=strict)
             self.teacher_obs_normalizer.load_state_dict(teacher_obs_normalizer_state_dict, strict=strict)
+            # Load teacher action noise std for KL loss support
+            if "std" in state_dict:
+                self.register_buffer("teacher_action_std", state_dict["std"])
+                self.teacher_noise_std_type = "scalar"
+            elif "log_std" in state_dict:
+                self.register_buffer("teacher_action_log_std", state_dict["log_std"])
+                self.teacher_noise_std_type = "gsde" if state_dict["log_std"].dim() == 2 else "log"
             # Set flag for successfully loading the parameters
             self.loaded_teacher = True
             self.teacher.eval()

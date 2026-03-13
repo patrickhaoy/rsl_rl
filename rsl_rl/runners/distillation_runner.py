@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import statistics
 import time
 import torch
 from collections import deque
@@ -55,6 +56,18 @@ class DistillationRunner(OnPolicyRunner):
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
 
+    def _get_partition_boundary(self) -> int:
+        """Number of student envs (first N envs). Teacher envs are the remaining."""
+        n_teacher = int(self.env.num_envs * self.alg.teacher_act_ratio)
+        return self.env.num_envs - n_teacher
+
+    def _get_term_manager(self):
+        """Access the underlying IsaacLab termination manager, or None."""
+        try:
+            return self.env.unwrapped.termination_manager
+        except AttributeError:
+            return None
+
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Initialize writer
         self._prepare_logging_writer()
@@ -79,6 +92,19 @@ class DistillationRunner(OnPolicyRunner):
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
+        # Per-partition (student/teacher) book keeping
+        student_boundary = self._get_partition_boundary()
+        student_rewbuffer = deque(maxlen=100)
+        teacher_rewbuffer = deque(maxlen=100)
+        student_lenbuffer = deque(maxlen=100)
+        teacher_lenbuffer = deque(maxlen=100)
+        term_mgr = self._get_term_manager()
+        term_names = list(term_mgr._term_names) if term_mgr is not None else []
+        student_term_counts = {name: 0 for name in term_names}
+        teacher_term_counts = {name: 0 for name in term_names}
+        student_ep_count = 0
+        teacher_ep_count = 0
+
         # Ensure all parameters are in-synced
         if self.is_distributed:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
@@ -89,6 +115,14 @@ class DistillationRunner(OnPolicyRunner):
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
             start = time.time()
+
+            # Reset per-iteration partition term counters
+            for name in term_names:
+                student_term_counts[name] = 0
+                teacher_term_counts[name] = 0
+            student_ep_count = 0
+            teacher_ep_count = 0
+
             # Rollout
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
@@ -114,6 +148,31 @@ class DistillationRunner(OnPolicyRunner):
                         new_ids = (dones > 0).nonzero(as_tuple=False)
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+
+                        # Per-partition tracking
+                        if new_ids.numel() > 0:
+                            done_flat = new_ids[:, 0]
+                            s_mask = done_flat < student_boundary
+                            t_mask = ~s_mask
+                            s_ids = done_flat[s_mask]
+                            t_ids = done_flat[t_mask]
+                            if s_ids.numel() > 0:
+                                student_rewbuffer.extend(cur_reward_sum[s_ids].cpu().numpy().tolist())
+                                student_lenbuffer.extend(cur_episode_length[s_ids].cpu().numpy().tolist())
+                                student_ep_count += s_ids.numel()
+                            if t_ids.numel() > 0:
+                                teacher_rewbuffer.extend(cur_reward_sum[t_ids].cpu().numpy().tolist())
+                                teacher_lenbuffer.extend(cur_episode_length[t_ids].cpu().numpy().tolist())
+                                teacher_ep_count += t_ids.numel()
+                            # Per-partition termination term tracking
+                            if term_mgr is not None and hasattr(term_mgr, '_last_episode_dones'):
+                                led = term_mgr._last_episode_dones  # [num_envs, num_terms]
+                                for j, name in enumerate(term_names):
+                                    if s_ids.numel() > 0:
+                                        student_term_counts[name] += led[s_ids, j].float().sum().item()
+                                    if t_ids.numel() > 0:
+                                        teacher_term_counts[name] += led[t_ids, j].float().sum().item()
+
                         cur_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
 
@@ -149,6 +208,33 @@ class DistillationRunner(OnPolicyRunner):
         # Save the final model after training
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+
+    def log(self, locs: dict, width: int = 80, pad: int = 35) -> None:
+        """Extended logging with per-partition (student/teacher) metrics."""
+        # Call parent log for standard metrics
+        super().log(locs, width, pad)
+
+        it = locs["it"]
+
+        # --- Student partition ---
+        if len(locs["student_rewbuffer"]) > 0:
+            self.writer.add_scalar("Student/mean_reward", statistics.mean(locs["student_rewbuffer"]), it)
+            self.writer.add_scalar("Student/mean_episode_length", statistics.mean(locs["student_lenbuffer"]), it)
+
+        if locs["student_ep_count"] > 0:
+            for name in locs["term_names"]:
+                rate = locs["student_term_counts"][name] / locs["student_ep_count"]
+                self.writer.add_scalar(f"Student/Episode_Termination/{name}", rate, it)
+
+        # --- Teacher partition ---
+        if len(locs["teacher_rewbuffer"]) > 0:
+            self.writer.add_scalar("Teacher/mean_reward", statistics.mean(locs["teacher_rewbuffer"]), it)
+            self.writer.add_scalar("Teacher/mean_episode_length", statistics.mean(locs["teacher_lenbuffer"]), it)
+
+        if locs["teacher_ep_count"] > 0:
+            for name in locs["term_names"]:
+                rate = locs["teacher_term_counts"][name] / locs["teacher_ep_count"]
+                self.writer.add_scalar(f"Teacher/Episode_Termination/{name}", rate, it)
 
     def _construct_algorithm(self, obs: TensorDict) -> Distillation:
         """Construct the distillation algorithm."""

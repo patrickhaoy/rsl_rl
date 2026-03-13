@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torchvision
 from tensordict import TensorDict
+from torch.distributions import Normal
 from typing import Any
 
 from rsl_rl.networks import MLP, EmpiricalNormalization
@@ -166,6 +167,18 @@ class StudentTeacherVision(StudentTeacher):
             parts.append(low_dim)
 
         return torch.cat(parts, dim=-1)
+
+    def get_student_distribution(self, obs: TensorDict) -> Normal:
+        """Return student distribution. get_student_obs already normalizes low-dim."""
+        student_obs = self.get_student_obs(obs)
+        mean = self.student(student_obs)
+        if self.noise_std_type == "scalar":
+            std = self.std.expand_as(mean)
+        elif self.noise_std_type == "log":
+            std = torch.exp(self.log_std).expand_as(mean)
+        else:
+            raise ValueError(f"Unknown noise_std_type: {self.noise_std_type}")
+        return Normal(mean, std)
 
     def update_normalization(self, obs: TensorDict) -> None:
         if self.student_obs_normalization and self.num_low_dim > 0:
