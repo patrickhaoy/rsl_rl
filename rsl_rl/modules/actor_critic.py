@@ -280,7 +280,7 @@ class ActorCritic(nn.Module):
                 raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         # Create distribution
         if self.noise_std_type == "gsde":
-            features = self.actor[:-1](obs)
+            features = self.actor.get_features()
             self.distribution.proba_distribution(mean, self.log_std, features)
         else:
             self.distribution = Normal(mean, std)
