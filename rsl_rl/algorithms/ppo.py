@@ -162,7 +162,6 @@ class PPO:
             self.rnd.update_normalization(obs)
 
         # Record the rewards and dones
-        # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
 
@@ -173,11 +172,33 @@ class PPO:
             # Add intrinsic rewards to extrinsic rewards
             self.transition.rewards += self.intrinsic_rewards
 
-        # Bootstrapping on time outs
-        if "time_outs" in extras:
-            self.transition.rewards += self.gamma * torch.squeeze(
-                self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1
+        # Compute V(terminal_obs) for envs that terminated/truncated
+        # True terminations (success/failure) get V=0; truncations (timeouts) get V(s_terminal)
+        has_dones = dones.any()
+        if has_dones and "terminal_observations" not in extras:
+            raise RuntimeError(
+                "Environment returned done=True but 'terminal_observations' missing from extras. "
+                "The env must provide pre-reset observations for correct value bootstrapping."
             )
+        if has_dones and "terminated" not in extras:
+            raise RuntimeError(
+                "Environment returned done=True but 'terminated' missing from extras. "
+                "The env must distinguish true terminations from truncations."
+            )
+        terminal_values = torch.zeros_like(self.transition.values)
+        if "terminal_observations" in extras:
+            terminal_env_ids = extras["terminal_env_ids"].to(self.device)
+            terminal_obs = TensorDict(
+                {key: value.to(self.device) for key, value in extras["terminal_observations"].items()},
+                batch_size=[len(terminal_env_ids)],
+                device=self.device,
+            )
+            terminal_vals = self.policy.evaluate(terminal_obs).detach()
+            # Zero out values for true terminations — only truncations should bootstrap
+            terminated_mask = extras["terminated"][terminal_env_ids].to(self.device).unsqueeze(1)
+            terminal_vals = terminal_vals * (~terminated_mask).float()
+            terminal_values[terminal_env_ids] = terminal_vals
+        self.transition.terminal_values = terminal_values
 
         # Record the transition
         self.storage.add_transitions(self.transition)
