@@ -37,17 +37,22 @@ class WandbSummaryWriter(SummaryWriter):
         # Initialize wandb
         wandb.init(project=project, entity=entity, name=run_name)
 
-        # Add log directory to wandb
-        wandb.config.update({"log_dir": log_dir})
+        # Add log directory to wandb. allow_val_change=True so wandb resume
+        # (WANDB_RESUME=allow) can update log_dir on relaunch with a new hydra
+        # timestamp dir; without it, the second invocation crashes with
+        # ConfigError("Attempted to change value of key 'log_dir' ...").
+        wandb.config.update({"log_dir": log_dir}, allow_val_change=True)
 
     def store_config(self, env_cfg: dict | object, runner_cfg: dict, alg_cfg: dict, policy_cfg: dict) -> None:
-        wandb.config.update({"runner_cfg": runner_cfg})
-        wandb.config.update({"policy_cfg": policy_cfg})
-        wandb.config.update({"alg_cfg": alg_cfg})
+        # allow_val_change=True so wandb resume can re-store configs that may
+        # differ slightly on relaunch (e.g. resume=True, load_run=<timestamp>).
+        wandb.config.update({"runner_cfg": runner_cfg}, allow_val_change=True)
+        wandb.config.update({"policy_cfg": policy_cfg}, allow_val_change=True)
+        wandb.config.update({"alg_cfg": alg_cfg}, allow_val_change=True)
         try:
-            wandb.config.update({"env_cfg": env_cfg.to_dict()})
+            wandb.config.update({"env_cfg": env_cfg.to_dict()}, allow_val_change=True)
         except Exception:
-            wandb.config.update({"env_cfg": asdict(env_cfg)})
+            wandb.config.update({"env_cfg": asdict(env_cfg)}, allow_val_change=True)
 
     def add_scalar(
         self,
